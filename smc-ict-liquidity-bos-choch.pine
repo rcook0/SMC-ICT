@@ -1,0 +1,394 @@
+//@version=6
+indicator("SMC/ICT Zones Pro (Generalized) – State + BOS/CHoCH + P/D + Liquidity [v6]", overlay=true, max_labels_count=500, max_boxes_count=500)
+
+//=============================================================================
+// Inputs
+//=============================================================================
+sym          = input.symbol(syminfo.tickerid, "Symbol")
+
+// Timeframes
+tfHTF        = input.timeframe("240", "HTF Narrative TF (e.g., H4)")
+tfTrend      = input.timeframe("60",  "Trend TF (e.g., H1)")
+tfEntry      = input.timeframe("15",  "Entry TF (e.g., M15)")
+tfMicro      = input.timeframe("5",   "Micro TF (e.g., M5)")
+
+// Structure + liquidity params
+swingLenHTF  = input.int(3, "HTF swing len (for dealing range)", minval=2, maxval=20)
+swingLenLTF  = input.int(3, "LTF swing len (for BOS/CHoCH)",    minval=2, maxval=20)
+eqTolTicks   = input.int(10, "EQH/EQL tolerance (ticks)",       minval=1, maxval=500)
+
+// Drawing + performance
+showOB       = input.bool(true,  "Show Order Blocks")
+showFVG      = input.bool(true,  "Show Fair Value Gaps")
+showBreaker  = input.bool(true,  "Show Breaker Blocks")
+showSweeps   = input.bool(true,  "Show Liquidity Sweeps")
+showEQ       = input.bool(true,  "Show EQH/EQL Liquidity Pools")
+showPD       = input.bool(true,  "Show Premium/Discount midline")
+showSignals  = input.bool(true,  "Show Signals (arrows)")
+alertsOn     = input.bool(true,  "Enable Alert Conditions")
+
+maxBoxesPerType = input.int(50, "Max boxes per type", minval=0, maxval=500)
+boxExtendBars   = input.int(250, "Box extend bars (to the right)", minval=10, maxval=5000)
+debounceBars    = input.int(10, "Signal debounce bars (per side)", minval=0, maxval=500)
+oneSignalPerZone= input.bool(true, "One signal per zone touch (per zone)")
+
+// Entry model selector
+entryModel = input.string("Any", "Entry Model", options=["Any","OB","FVG50","Breaker","OTE"])
+
+//=============================================================================
+// Helpers
+//=============================================================================
+get(src, tf) => request.security(sym, tf, src, barmerge.gaps_off, barmerge.lookahead_off)
+hh(tf) => get(high, tf)
+ll(tf) => get(low, tf)
+op(tf) => get(open, tf)
+cl(tf) => get(close, tf)
+tm(tf) => get(time, tf)
+
+f_trim_boxes(box[] arr, int maxN) =>
+    if maxN > 0
+        while array.size(arr) > maxN
+            box b = array.shift(arr)
+            box.delete(b)
+
+f_make_box_time(int leftT, int rightT, float y1, float y2, color borderC, color fillC) =>
+    box.new(leftT, y1, rightT, y2, xloc=xloc.bar_time, border_color=borderC, bgcolor=fillC)
+
+chartMs = timeframe.in_seconds(timeframe.period) * 1000
+rightTimeFromLeft(int leftTime) => leftTime + (boxExtendBars * chartMs)
+
+ticksToPrice(int ticks) => ticks * syminfo.mintick
+
+//=============================================================================
+// 1) HTF Dealing Range + Premium/Discount
+//=============================================================================
+htfH = hh(tfHTF)
+htfL = ll(tfHTF)
+
+ph = ta.pivothigh(htfH, swingLenHTF, swingLenHTF)
+pl = ta.pivotlow(htfL,  swingLenHTF, swingLenHTF)
+
+var float drHigh = na
+var float drLow  = na
+
+if not na(ph)
+    drHigh := ph
+if not na(pl)
+    drLow := pl
+
+drHigh := nz(drHigh, drHigh[1])
+drLow  := nz(drLow,  drLow[1])
+
+mid = (drHigh + drLow) / 2.0
+inDiscount = close < mid
+inPremium  = close > mid
+
+if showPD and not na(drHigh) and not na(drLow)
+    plot(mid, "P/D Mid", color=color.new(color.gray, 35), linewidth=1)
+    plot(drHigh, "DR High", color=color.new(color.gray, 85))
+    plot(drLow,  "DR Low",  color=color.new(color.gray, 85))
+
+//=============================================================================
+// 2) Trend filter (Trend TF)
+//=============================================================================
+trendUp   = hh(tfTrend)[1] > hh(tfTrend)[2] and ll(tfTrend)[1] > ll(tfTrend)[2]
+trendDown = hh(tfTrend)[1] < hh(tfTrend)[2] and ll(tfTrend)[1] < ll(tfTrend)[2]
+trend     = trendUp ? 1 : trendDown ? -1 : 0
+
+//=============================================================================
+// 3) LTF Structure: BOS / CHoCH (Entry TF pivots)
+//=============================================================================
+eH = hh(tfEntry)
+eL = ll(tfEntry)
+eC = cl(tfEntry)
+eT = tm(tfEntry)
+
+ePH = ta.pivothigh(eH, swingLenLTF, swingLenLTF)
+ePL = ta.pivotlow(eL,  swingLenLTF, swingLenLTF)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+if not na(ePH)
+    lastSwingHigh := ePH
+if not na(ePL)
+    lastSwingLow := ePL
+
+lastSwingHigh := nz(lastSwingHigh, lastSwingHigh[1])
+lastSwingLow  := nz(lastSwingLow,  lastSwingLow[1])
+
+bosUp   = not na(lastSwingHigh) and eC > lastSwingHigh
+bosDown = not na(lastSwingLow)  and eC < lastSwingLow
+
+chochUp   = bosUp   and trend == -1
+chochDown = bosDown and trend == 1
+
+//=============================================================================
+// 4) Liquidity Pools: EQH / EQL (Entry TF swing-to-swing)
+//=============================================================================
+var float prevSwingHigh = na
+var float prevSwingLow  = na
+
+if not na(ePH)
+    prevSwingHigh := lastSwingHigh[1]
+if not na(ePL)
+    prevSwingLow := lastSwingLow[1]
+
+eqTol = ticksToPrice(eqTolTicks)
+eqh = showEQ and not na(prevSwingHigh) and not na(lastSwingHigh) and math.abs(lastSwingHigh - prevSwingHigh) <= eqTol
+eql = showEQ and not na(prevSwingLow)  and not na(lastSwingLow)  and math.abs(lastSwingLow  - prevSwingLow)  <= eqTol
+
+plotshape(eqh, title="EQH", style=shape.circle, location=location.abovebar, size=size.tiny, color=color.new(color.yellow, 0), text="EQH")
+plotshape(eql, title="EQL", style=shape.circle, location=location.belowbar, size=size.tiny, color=color.new(color.yellow, 0), text="EQL")
+
+//=============================================================================
+// 5) Sweeps (Micro TF liquidity raids)
+//=============================================================================
+priorHigh = ta.highest(get(high, tfMicro), 10)[1]
+priorLow  = ta.lowest(get(low, tfMicro), 10)[1]
+sweepUp   = showSweeps and high > priorHigh
+sweepDn   = showSweeps and low  < priorLow
+
+plotshape(sweepUp, title="Sweep Up",   style=shape.triangledown, color=color.new(color.fuchsia, 0), size=size.tiny, location=location.abovebar, text="Sweep↑")
+plotshape(sweepDn, title="Sweep Down", style=shape.triangleup,   color=color.new(color.aqua, 0),    size=size.tiny, location=location.belowbar, text="Sweep↓")
+
+//=============================================================================
+// 6) Displacement proxy (proof of intent)
+//=============================================================================
+body    = math.abs(close - open)
+avgBody = ta.sma(math.abs(close - open), 20)
+displace = avgBody > 0 ? body > (1.5 * avgBody) : false
+
+intentLong  = (bosUp or chochUp) and displace
+intentShort = (bosDown or chochDown) and displace
+
+//=============================================================================
+// 7) Zones on Entry TF: OB, FVG, Breaker (created only after intent)
+//=============================================================================
+var box[] obBoxes   = array.new_box()
+var box[] fvgBoxes  = array.new_box()
+var box[] brkBoxes  = array.new_box()
+
+var float obLow  = na
+var float obHigh = na
+var float fvgLow = na
+var float fvgHigh = na
+var float brLow  = na
+var float brHigh = na
+
+var int obZoneId  = 0
+var int fvgZoneId = 0
+var int brZoneId  = 0
+
+var int obLeftTime  = na
+var int fvgLeftTime = na
+var int brLeftTime  = na
+
+isNewEntryBar = ta.change(tm(tfEntry))
+
+bearishOB = cl(tfEntry)[2] < op(tfEntry)[2]
+bullishOB = cl(tfEntry)[2] > op(tfEntry)[2]
+
+bullFvg = ll(tfEntry)[0] > hh(tfEntry)[2]
+bearFvg = hh(tfEntry)[0] < ll(tfEntry)[2]
+
+// Breaker proxy
+bullBreaker = cl(tfEntry)[1] > op(tfEntry)[1] and cl(tfEntry)[1] > hh(tfEntry)[2]
+bearBreaker = cl(tfEntry)[1] < op(tfEntry)[1] and cl(tfEntry)[1] < ll(tfEntry)[2]
+
+if isNewEntryBar
+    if showOB
+        if intentLong and bearishOB
+            obLow := ll(tfEntry)[2]
+            obHigh := hh(tfEntry)[2]
+            obLeftTime := int(tm(tfEntry)[2])
+            obZoneId += 1
+            array.push(obBoxes, f_make_box_time(obLeftTime, rightTimeFromLeft(obLeftTime), obLow, obHigh,
+                color.new(color.teal, 0), color.new(color.teal, 85)))
+            f_trim_boxes(obBoxes, maxBoxesPerType)
+
+        if intentShort and bullishOB
+            obLow := ll(tfEntry)[2]
+            obHigh := hh(tfEntry)[2]
+            obLeftTime := int(tm(tfEntry)[2])
+            obZoneId += 1
+            array.push(obBoxes, f_make_box_time(obLeftTime, rightTimeFromLeft(obLeftTime), obLow, obHigh,
+                color.new(color.orange, 0), color.new(color.orange, 85)))
+            f_trim_boxes(obBoxes, maxBoxesPerType)
+
+    if showFVG
+        if intentLong and bullFvg
+            fvgLow := hh(tfEntry)[2]
+            fvgHigh := ll(tfEntry)[0]
+            fvgLeftTime := int(tm(tfEntry)[2])
+            fvgZoneId += 1
+            array.push(fvgBoxes, f_make_box_time(fvgLeftTime, rightTimeFromLeft(fvgLeftTime), fvgLow, fvgHigh,
+                color.new(color.lime, 0), color.new(color.lime, 88)))
+            f_trim_boxes(fvgBoxes, maxBoxesPerType)
+
+        if intentShort and bearFvg
+            fvgLow := hh(tfEntry)[0]
+            fvgHigh := ll(tfEntry)[2]
+            fvgLeftTime := int(tm(tfEntry)[2])
+            fvgZoneId += 1
+            array.push(fvgBoxes, f_make_box_time(fvgLeftTime, rightTimeFromLeft(fvgLeftTime), fvgLow, fvgHigh,
+                color.new(color.red, 0), color.new(color.red, 88)))
+            f_trim_boxes(fvgBoxes, maxBoxesPerType)
+
+    if showBreaker
+        if intentLong and bullBreaker
+            brLow := ll(tfEntry)[1]
+            brHigh := hh(tfEntry)[1]
+            brLeftTime := int(tm(tfEntry)[1])
+            brZoneId += 1
+            array.push(brkBoxes, f_make_box_time(brLeftTime, rightTimeFromLeft(brLeftTime), brLow, brHigh,
+                color.new(color.green, 0), color.new(color.green, 88)))
+            f_trim_boxes(brkBoxes, maxBoxesPerType)
+
+        if intentShort and bearBreaker
+            brLow := ll(tfEntry)[1]
+            brHigh := hh(tfEntry)[1]
+            brLeftTime := int(tm(tfEntry)[1])
+            brZoneId += 1
+            array.push(brkBoxes, f_make_box_time(brLeftTime, rightTimeFromLeft(brLeftTime), brLow, brHigh,
+                color.new(color.maroon, 0), color.new(color.maroon, 88)))
+            f_trim_boxes(brkBoxes, maxBoxesPerType)
+
+//=============================================================================
+// 8) Entry checks + entry-model filters
+//=============================================================================
+microBull = get(close, tfMicro) > get(open, tfMicro)
+microBear = get(close, tfMicro) < get(open, tfMicro)
+
+inOBLong   = trend == 1  and not na(obLow)  and low <= obHigh
+inOBShort  = trend == -1 and not na(obHigh) and high >= obLow
+
+inFVGLong  = trend == 1  and not na(fvgLow)  and low <= fvgHigh
+inFVGShort = trend == -1 and not na(fvgHigh) and high >= fvgLow
+
+inBRKLong  = trend == 1  and not na(brLow)  and low <= brHigh
+inBRKShort = trend == -1 and not na(brHigh) and high >= brLow
+
+fvgMid = (fvgLow + fvgHigh) / 2.0
+inFVG50Long  = trend == 1  and not na(fvgMid) and low <= fvgMid and close >= fvgMid
+inFVG50Short = trend == -1 and not na(fvgMid) and high >= fvgMid and close <= fvgMid
+
+// OTE zone from HTF dealing range (very basic)
+float ote62 = na, ote79 = na
+if not na(drHigh) and not na(drLow)
+    rng = drHigh - drLow
+    ote62 := drHigh - (0.62 * rng)
+    ote79 := drHigh - (0.79 * rng)
+
+inOTELong  = trend == 1  and not na(ote62) and close <= ote62 and close >= ote79
+inOTEShort = trend == -1 and not na(drHigh) and not na(drLow) and (
+     close >= (drLow + (0.62 * (drHigh - drLow))) and close <= (drLow + (0.79 * (drHigh - drLow)))
+)
+
+wantOB    = entryModel == "Any" or entryModel == "OB"
+wantFVG50 = entryModel == "Any" or entryModel == "FVG50"
+wantBRK   = entryModel == "Any" or entryModel == "Breaker"
+wantOTE   = entryModel == "Any" or entryModel == "OTE"
+
+contextLong  = trend == 1  and inDiscount
+contextShort = trend == -1 and inPremium
+
+setupLong  = (sweepDn or eql) and (bosUp or chochUp)
+setupShort = (sweepUp or eqh) and (bosDown or chochDown)
+
+entryLong  = (wantOB and inOBLong) or (wantFVG50 and inFVG50Long) or (wantBRK and inBRKLong) or (wantOTE and inOTELong)
+entryShort = (wantOB and inOBShort) or (wantFVG50 and inFVG50Short) or (wantBRK and inBRKShort) or (wantOTE and inOTEShort)
+
+//=============================================================================
+// 9) State machine (narrative flow)
+//=============================================================================
+enum State { WAIT_SWEEP, WAIT_DISPLACE, WAIT_RETRACE, COOLDOWN }
+var State stLong  = State.WAIT_SWEEP
+var State stShort = State.WAIT_SWEEP
+
+var int lastLongSignalBar  = na
+var int lastShortSignalBar = na
+
+debounceOkLong  = debounceBars == 0 or na(lastLongSignalBar)  or (bar_index - lastLongSignalBar  > debounceBars)
+debounceOkShort = debounceBars == 0 or na(lastShortSignalBar) or (bar_index - lastShortSignalBar > debounceBars)
+
+// per-zone one-shot trackers
+var int lastFiredObZoneIdLong   = na
+var int lastFiredFvgZoneIdLong  = na
+var int lastFiredBrZoneIdLong   = na
+var int lastFiredObZoneIdShort  = na
+var int lastFiredFvgZoneIdShort = na
+var int lastFiredBrZoneIdShort  = na
+
+zoneOkLong =
+     not oneSignalPerZone or
+     ( (not inOBLong  or obZoneId  != lastFiredObZoneIdLong) and
+       (not (inFVGLong or inFVG50Long) or fvgZoneId != lastFiredFvgZoneIdLong) and
+       (not inBRKLong or brZoneId  != lastFiredBrZoneIdLong) )
+
+zoneOkShort =
+     not oneSignalPerZone or
+     ( (not inOBShort or obZoneId  != lastFiredObZoneIdShort) and
+       (not (inFVGShort or inFVG50Short) or fvgZoneId != lastFiredFvgZoneIdShort) and
+       (not inBRKShort or brZoneId != lastFiredBrZoneIdShort) )
+
+// Long state progression
+if stLong == State.WAIT_SWEEP
+    if contextLong and (sweepDn or eql)
+        stLong := State.WAIT_DISPLACE
+if stLong == State.WAIT_DISPLACE
+    if intentLong
+        stLong := State.WAIT_RETRACE
+if stLong == State.WAIT_RETRACE
+    if microBull and entryLong and setupLong
+        stLong := State.COOLDOWN
+if stLong == State.COOLDOWN
+    if not contextLong
+        stLong := State.WAIT_SWEEP
+
+// Short state progression
+if stShort == State.WAIT_SWEEP
+    if contextShort and (sweepUp or eqh)
+        stShort := State.WAIT_DISPLACE
+if stShort == State.WAIT_DISPLACE
+    if intentShort
+        stShort := State.WAIT_RETRACE
+if stShort == State.WAIT_RETRACE
+    if microBear and entryShort and setupShort
+        stShort := State.COOLDOWN
+if stShort == State.COOLDOWN
+    if not contextShort
+        stShort := State.WAIT_SWEEP
+
+// Fire signals only from WAIT_RETRACE stage
+rawLongSig  = showSignals and stLong  == State.WAIT_RETRACE and microBull and entryLong  and setupLong
+rawShortSig = showSignals and stShort == State.WAIT_RETRACE and microBear and entryShort and setupShort
+
+longSig  = rawLongSig  and debounceOkLong  and zoneOkLong
+shortSig = rawShortSig and debounceOkShort and zoneOkShort
+
+if longSig
+    lastLongSignalBar := bar_index
+    if oneSignalPerZone
+        if inOBLong
+            lastFiredObZoneIdLong := obZoneId
+        if (inFVGLong or inFVG50Long)
+            lastFiredFvgZoneIdLong := fvgZoneId
+        if inBRKLong
+            lastFiredBrZoneIdLong := brZoneId
+
+if shortSig
+    lastShortSignalBar := bar_index
+    if oneSignalPerZone
+        if inOBShort
+            lastFiredObZoneIdShort := obZoneId
+        if (inFVGShort or inFVG50Short)
+            lastFiredFvgZoneIdShort := fvgZoneId
+        if inBRKShort
+            lastFiredBrZoneIdShort := brZoneId
+
+plotshape(longSig,  title="BUY",  style=shape.arrowup,   color=color.new(color.lime, 0), location=location.belowbar, size=size.large, text="BUY")
+plotshape(shortSig, title="SELL", style=shape.arrowdown, color=color.new(color.red,  0), location=location.abovebar, size=size.large, text="SELL")
+
+alertcondition(alertsOn and longSig,  title="SMC/ICT BUY",  message="BUY signal on {{ticker}} (Generalized SMC/ICT confluence)")
+alertcondition(alertsOn and shortSig, title="SMC/ICT SELL", message="SELL signal on {{ticker}} (Generalized SMC/ICT confluence)")
