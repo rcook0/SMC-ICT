@@ -1,109 +1,253 @@
-//@version=5
-indicator("SMC/ICT Zones Pro (H1/M15/M5) – OB, FVG, Breaker, Sweeps", overlay=true, max_labels_count=500, max_boxes_count=500)
+//@version=6
+indicator("SMC/ICT Zones Pro (H1/M15/M5) – OB, FVG, Breaker, Sweeps [v6+]", overlay=true, max_labels_count=500, max_boxes_count=500)
 
-//-------------------- Inputs
-sym         = input.symbol(syminfo.tickerid, "Symbol")
-tfTrend     = input.timeframe("60", "Trend TF (H1)")
-tfEntry     = input.timeframe("15", "Entry TF (M15)")
-tfMicro     = input.timeframe("5",  "Micro TF (M5)")
-showOB      = input.bool(true,  "Show Order Blocks")
-showFVG     = input.bool(true,  "Show Fair Value Gaps")
-showBreaker = input.bool(true,  "Show Breaker Blocks")
-showSweeps  = input.bool(true,  "Show Liquidity Sweeps")
-showSignals = input.bool(true,  "Show Signals (arrows)")
-alertsOn    = input.bool(true,  "Enable Alert Conditions")
+//=============================================================================
+// Inputs
+//=============================================================================
+sym          = input.symbol(syminfo.tickerid, "Symbol")
+tfTrend      = input.timeframe("60", "Trend TF (H1)")
+tfEntry      = input.timeframe("15", "Entry TF (M15)")
+tfMicro      = input.timeframe("5",  "Micro TF (M5)")
 
-//-------------------- Helpers
+showOB       = input.bool(true,  "Show Order Blocks")
+showFVG      = input.bool(true,  "Show Fair Value Gaps")
+showBreaker  = input.bool(true,  "Show Breaker Blocks")
+showSweeps   = input.bool(true,  "Show Liquidity Sweeps")
+showSignals  = input.bool(true,  "Show Signals (arrows)")
+alertsOn     = input.bool(true,  "Enable Alert Conditions")
+
+// Production hardening
+maxBoxesPerType = input.int(50, "Max boxes per type (keeps chart fast)", minval=0, maxval=500)
+boxExtendBars   = input.int(250, "Box extend bars (to the right)", minval=10, maxval=5000)
+debounceBars    = input.int(10, "Signal debounce bars (per side)", minval=0, maxval=500)
+oneSignalPerZone= input.bool(true, "One signal per zone touch (per zone)", tooltip="If ON, the same OB/FVG/Breaker won't trigger multiple times until a NEW zone appears.")
+
+//=============================================================================
+// Helpers
+//=============================================================================
 get(src, tf) => request.security(sym, tf, src, barmerge.gaps_off, barmerge.lookahead_off)
 hh(tf) => get(high, tf)
 ll(tf) => get(low, tf)
 op(tf) => get(open, tf)
 cl(tf) => get(close, tf)
+tm(tf) => get(time, tf)     // time at TF bar open (ms since epoch)
 
-// Trend: simple HH/HL / LL/LH heuristic on Trend TF
+// Rolling-box manager
+f_trim_boxes(box[] arr, int maxN) =>
+    if maxN > 0
+        while array.size(arr) > maxN
+            box b = array.shift(arr)
+            box.delete(b)
+
+// Build an anchored box using TF timestamps (left/right)
+// Using time stamps makes boxes correctly aligned to the TF, not the chart bars.
+f_make_box_time(int leftT, int rightT, float y1, float y2, color borderC, color fillC) =>
+    // xloc.bar_time: left/right are timestamps (ms)
+    box.new(leftT, y1, rightT, y2, xloc=xloc.bar_time, border_color=borderC, bgcolor=fillC)
+
+// Convert "extend bars" to milliseconds for approximate future time in the chart TF.
+// We do this on chart TF because TradingView doesn't expose a direct "tf ms" reliably.
+// It's still anchored at left edge to the correct TF time, and extends visually right.
+chartMs = timeframe.in_seconds(timeframe.period) * 1000
+rightTimeFromLeft(int leftTime) => leftTime + (boxExtendBars * chartMs)
+
+//=============================================================================
+// Trend (H1) – simple HH/HL, LL/LH heuristic
+//=============================================================================
 trendUp   = hh(tfTrend)[1] > hh(tfTrend)[2] and ll(tfTrend)[1] > ll(tfTrend)[2]
 trendDown = hh(tfTrend)[1] < hh(tfTrend)[2] and ll(tfTrend)[1] < ll(tfTrend)[2]
 trend     = trendUp ? 1 : trendDown ? -1 : 0
 
-//-------------------- ICT Blocks on Entry TF (M15)
-var box[] obBoxes = array.new_box()
-var box[] brkBoxes = array.new_box()
-var box[] fvgBoxes = array.new_box()
+//=============================================================================
+// Storage
+//=============================================================================
+var box[] obBoxes   = array.new_box()
+var box[] fvgBoxes  = array.new_box()
+var box[] brkBoxes  = array.new_box()
+
+// "current" zone values (most recently detected on Entry TF)
+float obLow      = na
+float obHigh     = na
+int   obLeftTime = na
+
+float fvgLow      = na
+float fvgHigh     = na
+int   fvgLeftTime = na
+
+float brLow      = na
+float brHigh     = na
+int   brLeftTime = na
+
+// Zone IDs so we can do "one signal per zone"
+var int obZoneId  = 0
+var int fvgZoneId = 0
+var int brZoneId  = 0
+
+// "last-fired" trackers for oneSignalPerZone
+var int lastFiredObZoneIdLong  = na
+var int lastFiredFvgZoneIdLong = na
+var int lastFiredBrZoneIdLong  = na
+
+var int lastFiredObZoneIdShort  = na
+var int lastFiredFvgZoneIdShort = na
+var int lastFiredBrZoneIdShort  = na
+
+// Global debounce trackers (per side)
+var int lastLongSignalBar  = na
+var int lastShortSignalBar = na
+
+//=============================================================================
+// ICT Blocks on Entry TF (M15) – detect on new Entry TF bar
+//=============================================================================
+isNewEntryBar = ta.change(tm(tfEntry))
 
 // OB (last opposite candle) on Entry TF
-bearishOB = cl(tfEntry)[2] < op(tfEntry)[2]  // red candle
-bullishOB = cl(tfEntry)[2] > op(tfEntry)[2]  // green candle
-
-obLow  = na
-obHigh = na
-if showOB
-    if trend == 1 and bearishOB
-        obLow  := ll(tfEntry)[2]
-        obHigh := hh(tfEntry)[2]
-        array.push(obBoxes, box.new(bar_index-2, obLow, bar_index, obHigh, border_color=color.new(color.teal, 0), bgcolor=color.new(color.teal, 85)))
-    if trend == -1 and bullishOB
-        obLow  := ll(tfEntry)[2]
-        obHigh := hh(tfEntry)[2]
-        array.push(obBoxes, box.new(bar_index-2, obLow, bar_index, obHigh, border_color=color.new(color.orange, 0), bgcolor=color.new(color.orange, 85)))
+bearishOB = cl(tfEntry)[2] < op(tfEntry)[2]
+bullishOB = cl(tfEntry)[2] > op(tfEntry)[2]
 
 // FVG (3-candle gap) on Entry TF
-fvgLow  = na
-fvgHigh = na
-if showFVG
-    // bullish: low(0) > high(2)
-    bullFvg = ll(tfEntry)[0] > hh(tfEntry)[2]
-    // bearish: high(0) < low(2)
-    bearFvg = hh(tfEntry)[0] < ll(tfEntry)[2]
-    if bullFvg
-        fvgLow  := hh(tfEntry)[2]
-        fvgHigh := ll(tfEntry)[0]
-        array.push(fvgBoxes, box.new(bar_index-2, fvgLow, bar_index, fvgHigh, border_color=color.new(color.lime, 0), bgcolor=color.new(color.lime, 88)))
-    if bearFvg
-        fvgLow  := hh(tfEntry)[0]
-        fvgHigh := ll(tfEntry)[2]
-        array.push(fvgBoxes, box.new(bar_index-2, fvgLow, bar_index, fvgHigh, border_color=color.new(color.red, 0), bgcolor=color.new(color.red, 88)))
+bullFvg = ll(tfEntry)[0] > hh(tfEntry)[2]   // bullish imbalance
+bearFvg = hh(tfEntry)[0] < ll(tfEntry)[2]   // bearish imbalance
 
-// Breaker (flip candle after structure shift) – simplified proxy: strong candle aligned with trend following opposite OB
-breakerLow  = na
-breakerHigh = na
-if showBreaker
-    bullBreaker = trend == 1 and cl(tfEntry)[1] > op(tfEntry)[1] and cl(tfEntry)[1] > hh(tfEntry)[2]
-    bearBreaker = trend == -1 and cl(tfEntry)[1] < op(tfEntry)[1] and cl(tfEntry)[1] < ll(tfEntry)[2]
-    if bullBreaker
-        breakerLow  := ll(tfEntry)[1]
-        breakerHigh := hh(tfEntry)[1]
-        array.push(brkBoxes, box.new(bar_index-1, breakerLow, bar_index, breakerHigh, border_color=color.new(color.green, 0), bgcolor=color.new(color.green, 88)))
-    if bearBreaker
-        breakerLow  := ll(tfEntry)[1]
-        breakerHigh := hh(tfEntry)[1]
-        array.push(brkBoxes, box.new(bar_index-1, breakerLow, bar_index, breakerHigh, border_color=color.new(color.maroon, 0), bgcolor=color.new(color.maroon, 88)))
+// Breaker proxy: strong candle aligned with trend
+bullBreaker = trend == 1 and cl(tfEntry)[1] > op(tfEntry)[1] and cl(tfEntry)[1] > hh(tfEntry)[2]
+bearBreaker = trend == -1 and cl(tfEntry)[1] < op(tfEntry)[1] and cl(tfEntry)[1] < ll(tfEntry)[2]
 
-// Liquidity sweep on Micro TF: sweep prior swing
+// On new M15 bar: detect + draw boxes anchored to M15 bar time
+if isNewEntryBar
+    // --- Order Block
+    if showOB
+        if trend == 1 and bearishOB
+            obLow      := ll(tfEntry)[2]
+            obHigh     := hh(tfEntry)[2]
+            obLeftTime := int(tm(tfEntry)[2])
+            obZoneId   += 1
+            int rt = rightTimeFromLeft(obLeftTime)
+            array.push(obBoxes, f_make_box_time(obLeftTime, rt, obLow, obHigh, color.new(color.teal, 0), color.new(color.teal, 85)))
+            f_trim_boxes(obBoxes, maxBoxesPerType)
+
+        if trend == -1 and bullishOB
+            obLow      := ll(tfEntry)[2]
+            obHigh     := hh(tfEntry)[2]
+            obLeftTime := int(tm(tfEntry)[2])
+            obZoneId   += 1
+            int rt = rightTimeFromLeft(obLeftTime)
+            array.push(obBoxes, f_make_box_time(obLeftTime, rt, obLow, obHigh, color.new(color.orange, 0), color.new(color.orange, 85)))
+            f_trim_boxes(obBoxes, maxBoxesPerType)
+
+    // --- Fair Value Gap
+    if showFVG
+        if bullFvg
+            fvgLow      := hh(tfEntry)[2]
+            fvgHigh     := ll(tfEntry)[0]
+            fvgLeftTime := int(tm(tfEntry)[2])
+            fvgZoneId   += 1
+            int rt = rightTimeFromLeft(fvgLeftTime)
+            array.push(fvgBoxes, f_make_box_time(fvgLeftTime, rt, fvgLow, fvgHigh, color.new(color.lime, 0), color.new(color.lime, 88)))
+            f_trim_boxes(fvgBoxes, maxBoxesPerType)
+
+        if bearFvg
+            fvgLow      := hh(tfEntry)[0]
+            fvgHigh     := ll(tfEntry)[2]
+            fvgLeftTime := int(tm(tfEntry)[2])
+            fvgZoneId   += 1
+            int rt = rightTimeFromLeft(fvgLeftTime)
+            array.push(fvgBoxes, f_make_box_time(fvgLeftTime, rt, fvgLow, fvgHigh, color.new(color.red, 0), color.new(color.red, 88)))
+            f_trim_boxes(fvgBoxes, maxBoxesPerType)
+
+    // --- Breaker Block
+    if showBreaker
+        if bullBreaker
+            brLow      := ll(tfEntry)[1]
+            brHigh     := hh(tfEntry)[1]
+            brLeftTime := int(tm(tfEntry)[1])
+            brZoneId   += 1
+            int rt = rightTimeFromLeft(brLeftTime)
+            array.push(brkBoxes, f_make_box_time(brLeftTime, rt, brLow, brHigh, color.new(color.green, 0), color.new(color.green, 88)))
+            f_trim_boxes(brkBoxes, maxBoxesPerType)
+
+        if bearBreaker
+            brLow      := ll(tfEntry)[1]
+            brHigh     := hh(tfEntry)[1]
+            brLeftTime := int(tm(tfEntry)[1])
+            brZoneId   += 1
+            int rt = rightTimeFromLeft(brLeftTime)
+            array.push(brkBoxes, f_make_box_time(brLeftTime, rt, brLow, brHigh, color.new(color.maroon, 0), color.new(color.maroon, 88)))
+            f_trim_boxes(brkBoxes, maxBoxesPerType)
+
+//=============================================================================
+// Liquidity Sweeps on Micro TF (M5)
+//=============================================================================
 priorHigh = ta.highest(get(high, tfMicro), 10)[1]
 priorLow  = ta.lowest(get(low, tfMicro), 10)[1]
 sweepUp   = showSweeps and high > priorHigh
 sweepDn   = showSweeps and low  < priorLow
+
 plotshape(sweepUp, title="Sweep Up", style=shape.triangledown, color=color.new(color.fuchsia, 0), size=size.tiny, location=location.abovebar, text="Sweep↑")
 plotshape(sweepDn, title="Sweep Down", style=shape.triangleup, color=color.new(color.aqua, 0), size=size.tiny, location=location.belowbar, text="Sweep↓")
 
-//-------------------- Signal logic (touch + micro confirm)
-inOBLong  = trend == 1 and not na(obLow)  and low  <= obHigh
-inOBShort = trend == -1 and not na(obHigh) and high >= obLow
-inFVGLong = trend == 1 and not na(fvgLow)  and low  <= fvgHigh
-inFVGShort= trend == -1 and not na(fvgHigh) and high >= fvgLow
-inBRKLong = trend == 1 and not na(breakerLow)  and low  <= breakerHigh
-inBRKShort= trend == -1 and not na(breakerHigh) and high >= breakerLow
+//=============================================================================
+// Signal logic (touch + micro confirm) + production-grade gating
+//=============================================================================
+inOBLong   = trend == 1  and not na(obLow) and low  <= obHigh
+inOBShort  = trend == -1 and not na(obHigh) and high >= obLow
+
+inFVGLong  = trend == 1  and not na(fvgLow) and low  <= fvgHigh
+inFVGShort = trend == -1 and not na(fvgHigh) and high >= fvgLow
+
+inBRKLong  = trend == 1  and not na(brLow) and low  <= brHigh
+inBRKShort = trend == -1 and not na(brHigh) and high >= brLow
 
 microBull = get(close, tfMicro) > get(open, tfMicro)
 microBear = get(close, tfMicro) < get(open, tfMicro)
 
-longSig  = showSignals and trend == 1 and (inOBLong or inFVGLong or inBRKLong or sweepDn) and microBull
-shortSig = showSignals and trend == -1 and (inOBShort or inFVGShort or inBRKShort or sweepUp) and microBear
+rawLong  = showSignals and trend == 1  and (inOBLong or inFVGLong or inBRKLong or sweepDn) and microBull
+rawShort = showSignals and trend == -1 and (inOBShort or inFVGShort or inBRKShort or sweepUp) and microBear
 
-plotshape(longSig,  style=shape.arrowup,   color=color.new(color.lime, 0),   location=location.belowbar, size=size.large, text="BUY")
-plotshape(shortSig, style=shape.arrowdown, color=color.new(color.red,  0),   location=location.abovebar, size=size.large, text="SELL")
+// 1) Debounce: don’t fire too frequently (per side)
+debounceOkLong  = debounceBars == 0 or na(lastLongSignalBar)  or (bar_index - lastLongSignalBar  > debounceBars)
+debounceOkShort = debounceBars == 0 or na(lastShortSignalBar) or (bar_index - lastShortSignalBar > debounceBars)
+
+// 2) One signal per zone (optional): only allow if this zone id hasn't fired yet
+obOkLong   = not oneSignalPerZone or (inOBLong  and obZoneId  != lastFiredObZoneIdLong)  or not inOBLong
+fvgOkLong  = not oneSignalPerZone or (inFVGLong and fvgZoneId != lastFiredFvgZoneIdLong) or not inFVGLong
+brOkLong   = not oneSignalPerZone or (inBRKLong and brZoneId  != lastFiredBrZoneIdLong)  or not inBRKLong
+
+obOkShort  = not oneSignalPerZone or (inOBShort  and obZoneId  != lastFiredObZoneIdShort)  or not inOBShort
+fvgOkShort = not oneSignalPerZone or (inFVGShort and fvgZoneId != lastFiredFvgZoneIdShort) or not inFVGShort
+brOkShort  = not oneSignalPerZone or (inBRKShort and brZoneId  != lastFiredBrZoneIdShort)  or not inBRKShort
+
+zoneOkLong  = obOkLong and fvgOkLong and brOkLong
+zoneOkShort = obOkShort and fvgOkShort and brOkShort
+
+longSig  = rawLong  and debounceOkLong  and zoneOkLong
+shortSig = rawShort and debounceOkShort and zoneOkShort
+
+// Update trackers on signal fire
+if longSig
+    lastLongSignalBar := bar_index
+    if oneSignalPerZone
+        if inOBLong
+            lastFiredObZoneIdLong := obZoneId
+        if inFVGLong
+            lastFiredFvgZoneIdLong := fvgZoneId
+        if inBRKLong
+            lastFiredBrZoneIdLong := brZoneId
+
+if shortSig
+    lastShortSignalBar := bar_index
+    if oneSignalPerZone
+        if inOBShort
+            lastFiredObZoneIdShort := obZoneId
+        if inFVGShort
+            lastFiredFvgZoneIdShort := fvgZoneId
+        if inBRKShort
+            lastFiredBrZoneIdShort := brZoneId
+
+// Plot signals
+plotshape(longSig,  title="BUY",  style=shape.arrowup,   color=color.new(color.lime, 0), location=location.belowbar, size=size.large, text="BUY")
+plotshape(shortSig, title="SELL", style=shape.arrowdown, color=color.new(color.red,  0), location=location.abovebar, size=size.large, text="SELL")
 
 // Alerts
-if alertsOn
-    alertcondition(longSig,  "SMC/ICT BUY",  "BUY signal on {{ticker}} (H1/M15/M5 confluence)")
-    alertcondition(shortSig, "SMC/ICT SELL", "SELL signal on {{ticker}} (H1/M15/M5 confluence)")
+alertcondition(alertsOn and longSig,  title="SMC/ICT BUY",  message="BUY signal on {{ticker}} (H1/M15/M5 confluence)")
+alertcondition(alertsOn and shortSig, title="SMC/ICT SELL", message="SELL signal on {{ticker}} (H1/M15/M5 confluence)")
