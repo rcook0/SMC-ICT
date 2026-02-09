@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Axiom.Backtest</AssemblyName>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Axiom.Backtest</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Axiom.Core\Axiom.Core.csproj" />
+    <ProjectReference Include="..\Axiom.SmcIct\Axiom.SmcIct.csproj" />
+  </ItemGroup>
+</Project>

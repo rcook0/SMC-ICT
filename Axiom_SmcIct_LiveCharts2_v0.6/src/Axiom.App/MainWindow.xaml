@@ -1,0 +1,28 @@
+<Window x:Class="Axiom.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:lvc="clr-namespace:LiveChartsCore.SkiaSharpView.WPF;assembly=LiveChartsCore.SkiaSharpView.WPF"
+        Title="Axiom.SmcIct (v0.1) — LiveCharts2" Height="820" Width="1300">
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+    </Grid.RowDefinitions>
+
+    <DockPanel Grid.Row="0" Margin="10">
+      <TextBlock Text="{Binding Title}" FontSize="16" FontWeight="SemiBold" DockPanel.Dock="Left"/>
+      <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">
+        <Button Content="Reload" Margin="6,0,0,0" Padding="10,6" Command="{Binding ReloadCommand}" />
+      </StackPanel>
+    </DockPanel>
+
+    <lvc:CartesianChart Grid.Row="1"
+                       Series="{Binding Series}"
+                       XAxes="{Binding XAxes}"
+                       YAxes="{Binding YAxes}"
+                       Sections="{Binding Sections}"
+                       LegendPosition="Right"
+                       ZoomMode="X"
+                       DrawMarginFrame="{Binding DrawMarginFrame}"/>
+  </Grid>
+</Window>
