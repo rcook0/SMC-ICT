@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Axiom.SmcIct</AssemblyName>
+    <RootNamespace>Axiom.SmcIct</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Axiom.Core\Axiom.Core.csproj" />
+  </ItemGroup>
+</Project>
