@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Axiom.Core</AssemblyName>
+    <RootNamespace>Axiom</RootNamespace>
+  </PropertyGroup>
+</Project>
