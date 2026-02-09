@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Axiom.App</AssemblyName>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <RootNamespace>Axiom.App</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Axiom.Core\Axiom.Core.csproj" />
+    <ProjectReference Include="..\Axiom.SmcIct\Axiom.SmcIct.csproj" />
+  </ItemGroup>
+
+  <!-- Workaround for known WPF/.NET8 build issues where LiveChartsCore assembly isn't resolved by markup compiler:
+       explicitly reference LiveChartsCore + backend packages. -->
+  <ItemGroup>
+    <PackageReference Include="LiveChartsCore" Version="2.0.0-rc6.1" />
+    <PackageReference Include="LiveChartsCore.SkiaSharpView" Version="2.0.0-rc6.1" />
+    <PackageReference Include="LiveChartsCore.SkiaSharpView.WPF" Version="2.0.0-rc6.1" />
+    <PackageReference Include="SkiaSharp" Version="2.88.8" />
+    <PackageReference Include="SkiaSharp.Views.WPF" Version="2.88.8" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\data\sample_ohlcv.csv">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>sample_ohlcv.csv</Link>
+    </None>
+  </ItemGroup>
+</Project>
